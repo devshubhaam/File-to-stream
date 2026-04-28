@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
-from pyrogram.errors import FloodWait, UserNotParticipant
+from pyrogram.errors import FloodWait, UserNotParticipant, ChatForwardsRestricted, MediaEmpty
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -94,12 +94,9 @@ app.add_middleware(
 # --- LOG FILTER: YEH SIRF /dl/ WALE LOGS KO CHUPAYEGA ---
 class HideDLFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        # Agar log message mein "GET /dl/" hai, toh usse mat dikhao
         return "GET /dl/" not in record.getMessage()
 
-# Uvicorn ke 'access' logger par filter lagao
 logging.getLogger("uvicorn.access").addFilter(HideDLFilter())
-# --- FIX KHATAM ---
 
 bot = Client("SimpleStreamBot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_token=Config.BOT_TOKEN, in_memory=True)
 multi_clients = {}; work_loads = {}; class_cache = {}
@@ -229,9 +226,60 @@ __Just Send Or Forward Any File To Me And I will instantly give you a special li
 """
         await message.reply_text(reply_text)
 
-async def handle_file_upload(message: Message, user_id: int):
+
+# =====================================================================================
+# --- BUG FIX: HANDLE FILE UPLOAD (COPY + FORWARD FALLBACK) ---
+# =====================================================================================
+
+async def handle_file_upload(client: Client, message: Message, user_id: int):
+    sent_message = None
     try:
+        # --- METHOD 1: message.copy() try karo ---
+        # Yeh normal files ke liye best hai kyunki forward tag nahi lagta.
         sent_message = await message.copy(chat_id=Config.STORAGE_CHANNEL)
+
+    except (ChatForwardsRestricted, MediaEmpty) as e:
+        # --- METHOD 2: Agar copy() fail ho (protected channel ka forward, etc.) ---
+        # toh seedha forward_messages use karo.
+        print(f"INFO: copy() failed ({type(e).__name__}), trying forward_messages fallback...")
+        try:
+            forwarded = await client.forward_messages(
+                chat_id=Config.STORAGE_CHANNEL,
+                from_chat_id=message.chat.id,
+                message_ids=message.id
+            )
+            # forward_messages ek list return karta hai
+            if forwarded and isinstance(forwarded, list):
+                sent_message = forwarded[0]
+            else:
+                sent_message = forwarded
+        except Exception as fwd_err:
+            print(f"!!! ERROR: forward_messages bhi fail ho gaya: {traceback.format_exc()}")
+            await message.reply_text(
+                "❌ **Upload Failed!**\n\n"
+                "__Is file ko copy/forward karne ki permission nahi hai. "
+                "Please file ko directly download karke mujhe bhejein.__",
+                quote=True
+            )
+            return
+
+    except Exception as e:
+        print(f"!!! ERROR: handle_file_upload mein unexpected error: {traceback.format_exc()}")
+        await message.reply_text(
+            "❌ **Something went wrong!**\n\n"
+            f"__Error: `{type(e).__name__}`__\n\n"
+            "__Kripya dobara try karein.__",
+            quote=True
+        )
+        return
+
+    # --- Yahan tak aana matlab sent_message mil gaya ---
+    if not sent_message or not sent_message.id:
+        print("!!! ERROR: sent_message ya uska ID None hai.")
+        await message.reply_text("❌ File save nahi ho saki. Dobara try karein.", quote=True)
+        return
+
+    try:
         unique_id = secrets.token_urlsafe(8)
         await db.save_link(unique_id, sent_message.id)
         
@@ -240,11 +288,13 @@ async def handle_file_upload(message: Message, user_id: int):
         
         await message.reply_text("__✅ File Uploaded!__", reply_markup=button, quote=True)
     except Exception as e:
-        print(f"!!! ERROR: {traceback.format_exc()}"); await message.reply_text("Sorry, something went wrong.")
+        print(f"!!! ERROR: DB save ya reply mein error: {traceback.format_exc()}")
+        await message.reply_text("❌ Link generate nahi ho saka. Dobara try karein.", quote=True)
+
 
 @bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
-async def file_handler(_, message: Message):
-    await handle_file_upload(message, message.from_user.id)
+async def file_handler(client: Client, message: Message):
+    await handle_file_upload(client, message, message.from_user.id)
 
 @bot.on_chat_member_updated(filters.chat(Config.STORAGE_CHANNEL))
 async def simple_gatekeeper(c: Client, m_update: ChatMemberUpdated):
@@ -272,9 +322,6 @@ async def cleanup_channel(c: Client):
  
 @app.get("/")
 async def health_check():
-    """
-    This route provides a 200 OK response for uptime monitors.
-    """
     return {"status": "ok", "message": "Server is healthy and running!"}
 
 @app.get("/show/{unique_id}", response_class=HTMLResponse)
@@ -289,19 +336,30 @@ async def get_file_details_api(request: Request, unique_id: str):
     message_id = await db.get_link(unique_id)
     if not message_id:
         raise HTTPException(status_code=404, detail="Link expired or invalid.")
+    
     main_bot = multi_clients.get(0)
     if not main_bot:
         raise HTTPException(status_code=503, detail="Bot is not ready.")
+    
     try:
         message = await main_bot.get_messages(Config.STORAGE_CHANNEL, message_id)
-    except Exception:
+    except Exception as e:
+        print(f"!!! ERROR get_file_details_api get_messages: {traceback.format_exc()}")
         raise HTTPException(status_code=404, detail="File not found on Telegram.")
+    
+    # --- BUG FIX: message.empty check pehle karo ---
+    if not message or message.empty:
+        raise HTTPException(status_code=404, detail="Message not found or was deleted.")
+    
     media = message.document or message.video or message.audio
     if not media:
+        print(f"!!! ERROR: Message {message_id} mein koi media nahi mila. Message type: {message}")
         raise HTTPException(status_code=404, detail="Media not found in the message.")
-    file_name = media.file_name or "file"
+    
+    file_name = getattr(media, 'file_name', None) or "file"
     safe_file_name = "".join(c for c in file_name if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
-    mime_type = media.mime_type or "application/octet-stream"
+    mime_type = getattr(media, 'mime_type', None) or "application/octet-stream"
+    
     response_data = {
         "file_name": mask_filename(file_name),
         "file_size": get_readable_file_size(media.file_size),
@@ -368,5 +426,4 @@ async def stream_media(r:Request,mid:int,fname:str):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    # Log level ko "info" rakho taaki hamara filter kaam kar sake
     uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info")
