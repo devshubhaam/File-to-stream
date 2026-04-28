@@ -228,101 +228,64 @@ __Just Send Or Forward Any File To Me And I will instantly give you a special li
 
 
 # =====================================================================================
-# --- BUG FIX: HANDLE FILE UPLOAD (3-METHOD FALLBACK) ---
+# --- BUG FIX: HANDLE FILE UPLOAD (COPY + FORWARD FALLBACK) ---
 # =====================================================================================
 
 async def handle_file_upload(client: Client, message: Message, user_id: int):
     sent_message = None
-
-    # --- METHOD 1: message.copy() ---
-    # Best method - forward tag nahi lagta. Normal direct files ke liye kaam karta hai.
     try:
+        # --- METHOD 1: message.copy() try karo ---
+        # Yeh normal files ke liye best hai kyunki forward tag nahi lagta.
         sent_message = await message.copy(chat_id=Config.STORAGE_CHANNEL)
-        print(f"INFO: Method 1 (copy) success. New msg_id: {sent_message.id}")
-    except Exception as e1:
-        print(f"INFO: Method 1 (copy) failed: {type(e1).__name__}: {e1}")
 
-    # --- METHOD 2: forward_messages() ---
-    # Jab copy() fail ho. Forwarded messages ke liye kaam karta hai.
-    if not sent_message:
+    except (ChatForwardsRestricted, MediaEmpty) as e:
+        # --- METHOD 2: Agar copy() fail ho (protected channel ka forward, etc.) ---
+        # toh seedha forward_messages use karo.
+        print(f"INFO: copy() failed ({type(e).__name__}), trying forward_messages fallback...")
         try:
             forwarded = await client.forward_messages(
                 chat_id=Config.STORAGE_CHANNEL,
                 from_chat_id=message.chat.id,
                 message_ids=message.id
             )
-            if isinstance(forwarded, list) and forwarded:
+            # forward_messages ek list return karta hai
+            if forwarded and isinstance(forwarded, list):
                 sent_message = forwarded[0]
-            elif forwarded:
-                sent_message = forwarded
-            if sent_message:
-                print(f"INFO: Method 2 (forward) success. New msg_id: {sent_message.id}")
-        except Exception as e2:
-            print(f"INFO: Method 2 (forward) failed: {type(e2).__name__}: {e2}")
-
-    # --- METHOD 3: Download + Re-upload ---
-    # Last resort. File download karke storage channel mein fresh bhejta hai.
-    # Yeh tab kaam karta hai jab dono copy aur forward restrict ho.
-    if not sent_message:
-        try:
-            print("INFO: Method 3 (download+reupload) trying...")
-            # Media object se file info nikalo
-            media = message.document or message.video or message.audio
-            if not media:
-                raise ValueError("No media found in message")
-
-            file_path = await client.download_media(message, in_memory=True)
-
-            # Mime type ke hisaab se sahi send method use karo
-            mime = getattr(media, 'mime_type', '') or ''
-            fname = getattr(media, 'file_name', None) or 'file'
-            caption = None  # Caption mat dalo storage channel mein
-
-            if mime.startswith('video'):
-                sent_message = await client.send_video(
-                    chat_id=Config.STORAGE_CHANNEL,
-                    video=file_path,
-                    file_name=fname,
-                    caption=caption,
-                    supports_streaming=True
-                )
-            elif mime.startswith('audio'):
-                sent_message = await client.send_audio(
-                    chat_id=Config.STORAGE_CHANNEL,
-                    audio=file_path,
-                    file_name=fname,
-                    caption=caption
-                )
             else:
-                sent_message = await client.send_document(
-                    chat_id=Config.STORAGE_CHANNEL,
-                    document=file_path,
-                    file_name=fname,
-                    caption=caption
-                )
-            print(f"INFO: Method 3 (reupload) success. New msg_id: {sent_message.id}")
-        except Exception as e3:
-            print(f"!!! ERROR: Method 3 (reupload) bhi fail: {type(e3).__name__}: {e3}\n{traceback.format_exc()}")
+                sent_message = forwarded
+        except Exception as fwd_err:
+            print(f"!!! ERROR: forward_messages bhi fail ho gaya: {traceback.format_exc()}")
+            await message.reply_text(
+                "❌ **Upload Failed!**\n\n"
+                "__Is file ko copy/forward karne ki permission nahi hai. "
+                "Please file ko directly download karke mujhe bhejein.__",
+                quote=True
+            )
+            return
 
-    # --- Teeno methods fail ho gayi ---
-    if not sent_message or not sent_message.id:
+    except Exception as e:
+        print(f"!!! ERROR: handle_file_upload mein unexpected error: {traceback.format_exc()}")
         await message.reply_text(
-            "❌ **Upload Failed!**\n\n"
-            "__Is file ko process karna possible nahi hua. "
-            "Agar yeh kisi protected channel se forward ki hai, toh "
-            "please pehle download karke directly mujhe bhejein.__",
+            "❌ **Something went wrong!**\n\n"
+            f"__Error: `{type(e).__name__}`__\n\n"
+            "__Kripya dobara try karein.__",
             quote=True
         )
         return
 
-    # --- DB mein save karo aur link bhejo ---
+    # --- Yahan tak aana matlab sent_message mil gaya ---
+    if not sent_message or not sent_message.id:
+        print("!!! ERROR: sent_message ya uska ID None hai.")
+        await message.reply_text("❌ File save nahi ho saki. Dobara try karein.", quote=True)
+        return
+
     try:
         unique_id = secrets.token_urlsafe(8)
         await db.save_link(unique_id, sent_message.id)
-
+        
         verify_link = f"https://t.me/{Config.BOT_USERNAME}?start=verify_{unique_id}"
         button = InlineKeyboardMarkup([[InlineKeyboardButton("Get Link Now", url=verify_link)]])
-
+        
         await message.reply_text("__✅ File Uploaded!__", reply_markup=button, quote=True)
     except Exception as e:
         print(f"!!! ERROR: DB save ya reply mein error: {traceback.format_exc()}")
